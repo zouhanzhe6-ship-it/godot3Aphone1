@@ -1,0 +1,653 @@
+extends Node
+
+# ==========================================
+# 配置参数
+# ==========================================
+const VOCAB_SIZE: int = 10000
+const EMBED_DIM: int = 128
+const MAX_SENT_LEN: int = 32
+const NUM_HEADS: int = 4
+const FFN_EXPANSION: int = 2
+const USE_FLASH_ATTENTION: bool = true
+const DROPOUT_RATE: float = 0.1
+const TRAINING_MODE: bool = false
+
+# 优化参数
+const BLOCK_SIZE: int = 16  # Flash Attention块大小
+const LUT_SIZE: int = 2001  # 查找表大小
+const LUT_RANGE: float = 10.0  # 查找表范围 [-10, 10]
+
+# ==========================================
+# 优化后的神经网络结构
+# ==========================================
+class OptimizedNeuroSymbolicNet:
+    var language: Dictionary = {
+        "token_embed": PackedFloat32Array(),  # 扁平化 [VOCAB_SIZE * EMBED_DIM]
+        "pos_encoding": PackedFloat32Array(), # 扁平化 [NUM_HEADS * MAX_LEN * MAX_LEN]
+        "transformer_layers": []
+    }
+
+var neuro_symbolic_net: OptimizedNeuroSymbolicNet
+var memory_pool: MemoryPool
+var exp_lut: PackedFloat32Array
+var gelu_lut: PackedFloat32Array
+var tanh_lut: PackedFloat32Array
+
+# ==========================================
+# 内存池
+# ==========================================
+class MemoryPool:
+    var buffers: Dictionary = {}
+    
+    func get_buffer(size: int) -> PackedFloat32Array:
+        var key = str(size)
+        if not buffers.has(key):
+            var buf = PackedFloat32Array()
+            buf.resize(size)
+            buffers[key] = buf
+        return buffers[key]
+    
+    func return_buffer(buf: PackedFloat32Array) -> void:
+        # 可选：重置缓冲区
+        pass
+    
+    func clear():
+        buffers.clear()
+
+# ==========================================
+# 初始化
+# ==========================================
+func _init():
+    neuro_symbolic_net = OptimizedNeuroSymbolicNet.new()
+    memory_pool = MemoryPool.new()
+    _init_math_luts()
+    _init_neuro_symbolic_net()
+
+func _init_math_luts():
+    # 预计算exp查找表
+    exp_lut = PackedFloat32Array()
+    exp_lut.resize(LUT_SIZE)
+    for i in range(LUT_SIZE):
+        var x = (i - LUT_SIZE/2) * (2.0 * LUT_RANGE / LUT_SIZE)
+        exp_lut[i] = exp(x)
+    
+    # 预计算GELU查找表
+    gelu_lut = PackedFloat32Array()
+    gelu_lut.resize(LUT_SIZE)
+    var sqrt_2_over_pi = sqrt(2.0 / PI)
+    for i in range(LUT_SIZE):
+        var x = (i - LUT_SIZE/2) * (2.0 * LUT_RANGE / LUT_SIZE)
+        var cube = x * x * x
+        var tanh_arg = sqrt_2_over_pi * (x + 0.044715 * cube)
+        gelu_lut[i] = 0.5 * x * (1.0 + tanh(tanh_arg))
+    
+    # 预计算tanh查找表
+    tanh_lut = PackedFloat32Array()
+    tanh_lut.resize(LUT_SIZE)
+    for i in range(LUT_SIZE):
+        var x = (i - LUT_SIZE/2) * (2.0 * LUT_RANGE / LUT_SIZE)
+        tanh_lut[i] = tanh(x)
+
+# ==========================================
+# 快速数学函数
+# ==========================================
+func _fast_exp(x: float) -> float:
+    var idx = int(x * (LUT_SIZE / (2.0 * LUT_RANGE)) + LUT_SIZE/2)
+    idx = clamp(idx, 0, LUT_SIZE - 1)
+    return exp_lut[idx]
+
+func _fast_gelu(x: float) -> float:
+    var idx = int(x * (LUT_SIZE / (2.0 * LUT_RANGE)) + LUT_SIZE/2)
+    idx = clamp(idx, 0, LUT_SIZE - 1)
+    return gelu_lut[idx]
+
+func _fast_tanh(x: float) -> float:
+    var idx = int(x * (LUT_SIZE / (2.0 * LUT_RANGE)) + LUT_SIZE/2)
+    idx = clamp(idx, 0, LUT_SIZE - 1)
+    return tanh_lut[idx]
+
+# ==========================================
+# 矩阵初始化
+# ==========================================
+func _init_neuro_symbolic_net() -> void:
+    randomize()
+    var lang = neuro_symbolic_net.language
+    
+    # Token嵌入 - 扁平化存储
+    lang.token_embed = _init_dense_matrix_optimized(VOCAB_SIZE, EMBED_DIM)
+    
+    # 位置编码 - 扁平化
+    lang.pos_encoding = _init_relative_position_bias_optimized(MAX_SENT_LEN, NUM_HEADS)
+    
+    # 构建Transformer层
+    for l in range(2):
+        lang.transformer_layers.append({
+            # 注意力参数 - 扁平化
+            "w_q": _init_dense_matrix_optimized(EMBED_DIM, EMBED_DIM),
+            "w_k": _init_dense_matrix_optimized(EMBED_DIM, EMBED_DIM),
+            "w_v": _init_dense_matrix_optimized(EMBED_DIM, EMBED_DIM),
+            "w_o": _init_dense_matrix_optimized(EMBED_DIM, EMBED_DIM),
+            
+            # FFN参数 - 扁平化
+            "w_f1": _init_dense_matrix_optimized(EMBED_DIM, EMBED_DIM * FFN_EXPANSION),
+            "w_f2": _init_dense_matrix_optimized(EMBED_DIM * FFN_EXPANSION, EMBED_DIM),
+            "b_f1": _init_bias_optimized(EMBED_DIM * FFN_EXPANSION),
+            "b_f2": _init_bias_optimized(EMBED_DIM),
+            
+            # 层归一化
+            "norm1_scale": _create_filled_array_optimized(EMBED_DIM, 1.0),
+            "norm1_bias": _create_filled_array_optimized(EMBED_DIM, 0.0),
+            "norm2_scale": _create_filled_array_optimized(EMBED_DIM, 1.0),
+            "norm2_bias": _create_filled_array_optimized(EMBED_DIM, 0.0),
+            
+            # 维度信息
+            "head_dim": EMBED_DIM / NUM_HEADS,
+            "embed_dim": EMBED_DIM,
+            "num_heads": NUM_HEADS
+        })
+
+func _init_dense_matrix_optimized(rows: int, cols: int) -> PackedFloat32Array:
+    var matrix = PackedFloat32Array()
+    matrix.resize(rows * cols)
+    var scale = sqrt(2.0 / (rows + cols))
+    
+    for i in range(rows):
+        var base_idx = i * cols
+        for j in range(cols):
+            matrix[base_idx + j] = randf_range(-scale, scale)
+    return matrix
+
+func _init_bias_optimized(size: int) -> PackedFloat32Array:
+    var bias = PackedFloat32Array()
+    bias.resize(size)
+    bias.fill(0.0)
+    return bias
+
+func _init_relative_position_bias_optimized(max_len: int, num_heads: int) -> PackedFloat32Array:
+    var bias = PackedFloat32Array()
+    bias.resize(num_heads * max_len * max_len)
+    
+    for h in range(num_heads):
+        var head_offset = h * max_len * max_len
+        for i in range(max_len):
+            var row_offset = head_offset + i * max_len
+            for j in range(max_len):
+                var distance = abs(i - j)
+                bias[row_offset + j] = sin(distance * 0.1) * 0.1
+    return bias
+
+func _create_filled_array_optimized(size: int, value: float) -> PackedFloat32Array:
+    var arr = PackedFloat32Array()
+    arr.resize(size)
+    arr.fill(value)
+    return arr
+
+# ==========================================
+# 辅助函数
+# ==========================================
+func _get(matrix: PackedFloat32Array, rows: int, cols: int, i: int, j: int) -> float:
+    return matrix[i * cols + j]
+
+func _set(matrix: PackedFloat32Array, rows: int, cols: int, i: int, j: int, val: float) -> void:
+    matrix[i * cols + j] = val
+
+# ==========================================
+# 优化矩阵乘法
+# ==========================================
+static func _matmul_optimized(a: PackedFloat32Array, b: PackedFloat32Array, 
+                             m: int, k: int, n: int) -> PackedFloat32Array:
+    # A: m×k, B: k×n, C: m×n
+    var c = PackedFloat32Array()
+    c.resize(m * n)
+    c.fill(0.0)
+    
+    # 循环重排优化
+    for i in range(m):
+        var a_row_start = i * k
+        var c_row_start = i * n
+        
+        for l in range(k):
+            var a_val = a[a_row_start + l]
+            if a_val == 0.0:
+                continue
+                
+            var b_row_start = l * n
+            var c_offset = c_row_start
+            
+            # 循环展开 x4
+            var j = 0
+            while j < n - 3:
+                c[c_offset + j] += a_val * b[b_row_start + j]
+                c[c_offset + j + 1] += a_val * b[b_row_start + j + 1]
+                c[c_offset + j + 2] += a_val * b[b_row_start + j + 2]
+                c[c_offset + j + 3] += a_val * b[b_row_start + j + 3]
+                j += 4
+            
+            while j < n:
+                c[c_offset + j] += a_val * b[b_row_start + j]
+                j += 1
+    
+    return c
+
+# ==========================================
+# 线性变换优化
+# ==========================================
+func _linear_transform_optimized(x: PackedFloat32Array, weights: PackedFloat32Array,
+                                 seq_len: int, input_dim: int, output_dim: int) -> PackedFloat32Array:
+    # 使用内存池
+    var result = memory_pool.get_buffer(seq_len * output_dim)
+    result.fill(0.0)
+    
+    for i in range(seq_len):
+        var x_offset = i * input_dim
+        var out_offset = i * output_dim
+        
+        for j in range(input_dim):
+            var x_val = x[x_offset + j]
+            if x_val == 0.0:
+                continue
+                
+            var w_offset = j * output_dim
+            var out_ptr = out_offset
+            
+            # 循环展开
+            var k = 0
+            while k < output_dim - 3:
+                result[out_ptr + k] += x_val * weights[w_offset + k]
+                result[out_ptr + k + 1] += x_val * weights[w_offset + k + 1]
+                result[out_ptr + k + 2] += x_val * weights[w_offset + k + 2]
+                result[out_ptr + k + 3] += x_val * weights[w_offset + k + 3]
+                k += 4
+            
+            while k < output_dim:
+                result[out_ptr + k] += x_val * weights[w_offset + k]
+                k += 1
+    
+    return result
+
+# ==========================================
+# Flash Attention V2优化实现
+# ==========================================
+func _flash_attention_v2(q: PackedFloat32Array, k: PackedFloat32Array, v: PackedFloat32Array,
+                         seq_len: int, dim: int, num_heads: int, 
+                         pos_bias: PackedFloat32Array) -> PackedFloat32Array:
+    var head_dim = dim / num_heads
+    var output = memory_pool.get_buffer(seq_len * dim)
+    output.fill(0.0)
+    
+    var sqrt_d = 1.0 / sqrt(float(head_dim))
+    
+    # 外循环Q块
+    for q_start in range(0, seq_len, BLOCK_SIZE):
+        var q_end = min(q_start + BLOCK_SIZE, seq_len)
+        var q_len = q_end - q_start
+        
+        # 内循环K/V块
+        for kv_start in range(0, seq_len, BLOCK_SIZE):
+            var kv_end = min(kv_start + BLOCK_SIZE, seq_len)
+            var kv_len = kv_end - kv_start
+            
+            # 对每个头处理
+            for h in range(num_heads):
+                var head_offset = h * head_dim
+                var pos_offset = h * seq_len * seq_len
+                
+                # 计算当前块的注意力分数
+                var scores = memory_pool.get_buffer(q_len * kv_len)
+                
+                for qi in range(q_len):
+                    var q_abs_idx = q_start + qi
+                    var q_offset = q_abs_idx * dim + head_offset
+                    var s_row_offset = qi * kv_len
+                    
+                    for kj in range(kv_len):
+                        var k_abs_idx = kv_start + kj
+                        var k_offset = k_abs_idx * dim + head_offset
+                        
+                        # 点积
+                        var dot = 0.0
+                        var q_ptr = q_offset
+                        var k_ptr = k_offset
+                        
+                        # 循环展开
+                        var d = 0
+                        while d < head_dim - 3:
+                            dot += q[q_ptr + d] * k[k_ptr + d]
+                            dot += q[q_ptr + d + 1] * k[k_ptr + d + 1]
+                            dot += q[q_ptr + d + 2] * k[k_ptr + d + 2]
+                            dot += q[q_ptr + d + 3] * k[k_ptr + d + 3]
+                            d += 4
+                        
+                        while d < head_dim:
+                            dot += q[q_ptr + d] * k[k_ptr + d]
+                            d += 1
+                        
+                        # 添加位置偏置
+                        if pos_bias.size() > 0:
+                            dot += pos_bias[pos_offset + q_abs_idx * seq_len + k_abs_idx]
+                        
+                        scores[s_row_offset + kj] = dot * sqrt_d
+                
+                # 在线softmax并加权V
+                for qi in range(q_len):
+                    var s_row_offset = qi * kv_len
+                    var q_abs_idx = q_start + qi
+                    var out_offset = q_abs_idx * dim + head_offset
+                    
+                    # 找最大值
+                    var max_val = scores[s_row_offset]
+                    for kj in range(1, kv_len):
+                        if scores[s_row_offset + kj] > max_val:
+                            max_val = scores[s_row_offset + kj]
+                    
+                    # 计算exp和
+                    var exp_sum = 0.0
+                    var exp_vals = memory_pool.get_buffer(kv_len)
+                    
+                    for kj in range(kv_len):
+                        var exp_val = _fast_exp(scores[s_row_offset + kj] - max_val)
+                        exp_vals[kj] = exp_val
+                        exp_sum += exp_val
+                    
+                    # 加权V并累加到输出
+                    var inv_sum = 1.0 / (exp_sum + 1e-9)
+                    for kj in range(kv_len):
+                        var weight = exp_vals[kj] * inv_sum
+                        var k_abs_idx = kv_start + kj
+                        var v_offset = k_abs_idx * dim + head_offset
+                        
+                        var out_ptr = out_offset
+                        var v_ptr = v_offset
+                        
+                        # 循环展开
+                        var d = 0
+                        while d < head_dim - 3:
+                            output[out_ptr + d] += weight * v[v_ptr + d]
+                            output[out_ptr + d + 1] += weight * v[v_ptr + d + 1]
+                            output[out_ptr + d + 2] += weight * v[v_ptr + d + 2]
+                            output[out_ptr + d + 3] += weight * v[v_ptr + d + 3]
+                            d += 4
+                        
+                        while d < head_dim:
+                            output[out_ptr + d] += weight * v[v_ptr + d]
+                            d += 1
+    
+    return output
+
+# ==========================================
+# 多头注意力层优化
+# ==========================================
+func _multi_head_attention_optimized(x: PackedFloat32Array, layer: Dictionary, 
+                                     pos_encoding: PackedFloat32Array,
+                                     seq_len: int) -> PackedFloat32Array:
+    var dim = layer["embed_dim"]
+    var num_heads = layer["num_heads"]
+    
+    # 残差连接
+    var residual = x.duplicate()
+    
+    # Pre-LN
+    var normalized = _layer_norm_2d_optimized(x, layer["norm1_scale"], layer["norm1_bias"], seq_len, dim)
+    
+    # QKV变换
+    var q = _linear_transform_optimized(normalized, layer["w_q"], seq_len, dim, dim)
+    var k = _linear_transform_optimized(normalized, layer["w_k"], seq_len, dim, dim)
+    var v = _linear_transform_optimized(normalized, layer["w_v"], seq_len, dim, dim)
+    
+    # Flash Attention
+    var attn_output = _flash_attention_v2(q, k, v, seq_len, dim, num_heads, pos_encoding)
+    
+    # 输出投影
+    attn_output = _linear_transform_optimized(attn_output, layer["w_o"], seq_len, dim, dim)
+    
+    # 残差连接 + Dropout
+    for i in range(seq_len * dim):
+        x[i] = residual[i] + attn_output[i]
+        if TRAINING_MODE and randf() < DROPOUT_RATE:
+            x[i] = 0.0
+    
+    return x
+
+# ==========================================
+# 前馈网络层优化
+# ==========================================
+func _ffn_layer_optimized(x: PackedFloat32Array, layer: Dictionary, seq_len: int) -> PackedFloat32Array:
+    var dim = layer["embed_dim"]
+    var hidden_dim = EMBED_DIM * FFN_EXPANSION
+    
+    var residual = x.duplicate()
+    var normalized = _layer_norm_2d_optimized(x, layer["norm2_scale"], layer["norm2_bias"], seq_len, dim)
+    
+    # 第一层线性变换
+    var hidden = _linear_transform_optimized(normalized, layer["w_f1"], seq_len, dim, hidden_dim)
+    
+    # 添加偏置 + GELU
+    for i in range(seq_len * hidden_dim):
+        hidden[i] += layer["b_f1"][i % hidden_dim]
+        hidden[i] = _fast_gelu(hidden[i])
+    
+    # 第二层线性变换
+    var output = _linear_transform_optimized(hidden, layer["w_f2"], seq_len, hidden_dim, dim)
+    
+    # 添加偏置
+    for i in range(seq_len * dim):
+        output[i] += layer["b_f2"][i % dim]
+    
+    # 残差连接 + Dropout
+    for i in range(seq_len * dim):
+        x[i] = residual[i] + output[i]
+        if TRAINING_MODE and randf() < DROPOUT_RATE:
+            x[i] = 0.0
+    
+    return x
+
+# ==========================================
+# 层归一化优化
+# ==========================================
+func _layer_norm_2d_optimized(x: PackedFloat32Array, scale: PackedFloat32Array,
+                              bias: PackedFloat32Array, seq_len: int, dim: int) -> PackedFloat32Array:
+    var result = memory_pool.get_buffer(seq_len * dim)
+    var epsilon = 1e-5
+    
+    for i in range(seq_len):
+        var offset = i * dim
+        
+        # 计算均值
+        var mean = 0.0
+        for j in range(dim):
+            mean += x[offset + j]
+        mean /= dim
+        
+        # 计算方差
+        var variance = 0.0
+        for j in range(dim):
+            var diff = x[offset + j] - mean
+            variance += diff * diff
+        variance /= dim
+        
+        # 归一化
+        var inv_std = 1.0 / sqrt(variance + epsilon)
+        for j in range(dim):
+            var normalized = (x[offset + j] - mean) * inv_std
+            result[offset + j] = normalized * scale[j] + bias[j]
+    
+    return result
+
+# ==========================================
+# Token嵌入
+# ==========================================
+func _embed_tokens_optimized(token_ids: PackedInt32Array, embed_matrix: PackedFloat32Array) -> PackedFloat32Array:
+    var embeddings = PackedFloat32Array()
+    embeddings.resize(MAX_SENT_LEN * EMBED_DIM)
+    
+    for i in range(MAX_SENT_LEN):
+        var token_id = token_ids[i]
+        var out_offset = i * EMBED_DIM
+        
+        if token_id < VOCAB_SIZE:
+            var embed_offset = token_id * EMBED_DIM
+            for j in range(EMBED_DIM):
+                embeddings[out_offset + j] = embed_matrix[embed_offset + j]
+        else:
+            for j in range(EMBED_DIM):
+                embeddings[out_offset + j] = 0.0
+    
+    return embeddings
+
+func _extract_cls_token_optimized(x: PackedFloat32Array) -> PackedFloat32Array:
+    var cls_features = PackedFloat32Array()
+    cls_features.resize(EMBED_DIM)
+    
+    for i in range(EMBED_DIM):
+        cls_features[i] = x[i]  # [CLS] token在第一行
+    
+    return cls_features
+
+# ==========================================
+# 前向传播主函数优化
+# ==========================================
+func forward_optimized(token_ids: PackedInt32Array) -> PackedFloat32Array:
+    var lang = neuro_symbolic_net.language
+    
+    # Token嵌入
+    var x = _embed_tokens_optimized(token_ids, lang.token_embed)
+    
+    # Transformer层
+    for layer_idx in range(lang.transformer_layers.size()):
+        var layer = lang.transformer_layers[layer_idx]
+        
+        # 注意力子层
+        x = _multi_head_attention_optimized(x, layer, lang.pos_encoding, MAX_SENT_LEN)
+        
+        # FFN子层
+        x = _ffn_layer_optimized(x, layer, MAX_SENT_LEN)
+    
+    # 返回[CLS] token
+    return _extract_cls_token_optimized(x)
+
+# ==========================================
+# 兼容性接口（保持原API）
+# ==========================================
+func forward(token_ids: PackedInt32Array) -> PackedFloat32Array:
+    return forward_optimized(token_ids)
+
+# ==========================================
+# 调试函数
+# ==========================================
+func debug_forward(token_ids: PackedInt32Array) -> void:
+    print("=" * 50)
+    print("🚀 开始优化版前向传播调试")
+    print("输入token IDs: ", token_ids)
+    
+    var start_time = Time.get_ticks_usec()
+    var result = forward_optimized(token_ids)
+    var end_time = Time.get_ticks_usec()
+    
+    print("输出[CLS]向量 (前5个值): ", result.slice(0, 5))
+    print("推理时间: ", (end_time - start_time) / 1000.0, " ms")
+    print("=" * 50)
+
+# ==========================================
+# 性能对比测试
+# ==========================================
+func benchmark():
+    print("\n" + "=" * 50)
+    print("🔥 性能对比测试")
+    print("=" * 50)
+    
+    # 创建原始版本（如果可用）
+    var original = null
+    if has_method("_init_neuro_symbolic_net_original"):
+        original = NeuroSymbolicNet.new()
+    
+    # 准备测试数据
+    var tokens = PackedInt32Array()
+    for i in range(MAX_SENT_LEN):
+        tokens.append(randi() % VOCAB_SIZE)
+    
+    # 预热
+    for _ in range(5):
+        forward_optimized(tokens)
+    
+    # 测试优化版本
+    var times_opt = []
+    for test in range(10):
+        var start = Time.get_ticks_usec()
+        var result = forward_optimized(tokens)
+        var time_ms = (Time.get_ticks_usec() - start) / 1000.0
+        times_opt.append(time_ms)
+    
+    var avg_opt = 0.0
+    for t in times_opt:
+        avg_opt += t
+    avg_opt /= times_opt.size()
+    
+    print("优化版本平均: %.2f ms" % avg_opt)
+    print("优化版本最快: %.2f ms" % times_opt.min())
+    print("优化版本最慢: %.2f ms" % times_opt.max())
+    
+    # 测试原始版本（如果可用）
+    if original:
+        var times_orig = []
+        for test in range(10):
+            var start = Time.get_ticks_usec()
+            var result = original.forward(tokens)
+            var time_ms = (Time.get_ticks_usec() - start) / 1000.0
+            times_orig.append(time_ms)
+        
+        var avg_orig = 0.0
+        for t in times_orig:
+            avg_orig += t
+        avg_orig /= times_orig.size()
+        
+        print("\n原始版本平均: %.2f ms" % avg_orig)
+        print("加速比: %.2fx" % (avg_orig / avg_opt))
+    
+    print("=" * 50)
+
+# ==========================================
+# 正确性验证
+# ==========================================
+func validate():
+    print("\n" + "=" * 50)
+    print("✅ 正确性验证")
+    print("=" * 50)
+    
+    var test_cases = [
+        PackedInt32Array([1, 2, 3, 4, 5] + [0] * (MAX_SENT_LEN - 5)),
+        PackedInt32Array([101, 202, 303] + [0] * (MAX_SENT_LEN - 3)),
+        PackedInt32Array([999] + [0] * (MAX_SENT_LEN - 1))
+    ]
+    
+    for i in range(test_cases.size()):
+        var tokens = test_cases[i]
+        var result = forward_optimized(tokens)
+        
+        print("\n测试用例 %d:" % (i + 1))
+        print("输入: ", tokens.slice(0, 5), "...")
+        print("输出范数: %.4f" % _vector_norm(result))
+        print("输出前5个值: ", result.slice(0, 5))
+
+func _vector_norm(vec: PackedFloat32Array) -> float:
+    var sum_sq = 0.0
+    for v in vec:
+        sum_sq += v * v
+    return sqrt(sum_sq)
+
+# ==========================================
+# 测试运行
+# ==========================================
+func _ready():
+    # 创建测试输入
+    var test_tokens = PackedInt32Array()
+    for i in range(MAX_SENT_LEN):
+        test_tokens.append(randi() % VOCAB_SIZE)
+    
+    # 运行调试
+    debug_forward(test_tokens)
+    
+    # 运行验证
+    validate()
+    
+    # 运行性能测试
+    benchmark()
